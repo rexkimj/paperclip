@@ -20,6 +20,11 @@ import {
 } from "@paperclipai/adapter-codex-local/server";
 import { agentConfigurationDoc as codexAgentConfigurationDoc, models as codexModels } from "@paperclipai/adapter-codex-local";
 import {
+  execute as ollamaExecute,
+  testEnvironment as ollamaTestEnvironment,
+} from "@paperclipai/adapter-ollama-local/server";
+import { agentConfigurationDoc as ollamaAgentConfigurationDoc, models as ollamaModels } from "@paperclipai/adapter-ollama-local";
+import {
   execute as cursorExecute,
   listCursorSkills,
   syncCursorSkills,
@@ -119,6 +124,21 @@ const codexLocalAdapter: ServerAdapterModule = {
   instructionsPathKey: "instructionsFilePath",
   requiresMaterializedRuntimeSkills: false,
   agentConfigurationDoc: codexAgentConfigurationDoc,
+  getQuotaWindows: codexGetQuotaWindows,
+};
+
+const ollamaLocalAdapter: ServerAdapterModule = {
+  type: "ollama_local",
+  execute: ollamaExecute,
+  testEnvironment: ollamaTestEnvironment,
+  listSkills: listCodexSkills,
+  syncSkills: syncCodexSkills,
+  sessionCodec: codexSessionCodec,
+  sessionManagement: getAdapterSessionManagement("ollama_local") ?? undefined,
+  models: ollamaModels,
+  listModels: listCodexModels,
+  supportsLocalAgentJwt: true,
+  agentConfigurationDoc: ollamaAgentConfigurationDoc,
   getQuotaWindows: codexGetQuotaWindows,
 };
 
@@ -237,6 +257,7 @@ function registerBuiltInAdapters() {
     geminiLocalAdapter,
     openclawGatewayAdapter,
     hermesLocalAdapter,
+    ollamaLocalAdapter,
     processAdapter,
     httpAdapter,
   ]) {
