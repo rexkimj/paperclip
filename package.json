@@ -61,5 +61,8 @@
     "overrides": {
       "rollup": ">=4.59.0"
     }
+  },
+  "dependencies": {
+    "paperclip-plugin-acp": "link:paperclip-plugin-acp"
   }
 }

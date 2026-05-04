@@ -61,7 +61,6 @@ function hasNonEmptyEnvValue(env: Record<string, string>, key: string): boolean 
 }
 
 function resolveCodexBillingType(env: Record<string, string>): "api" | "subscription" {
-  // Codex uses API-key auth when OPENAI_API_KEY is present; otherwise rely on local login/session auth.
   return hasNonEmptyEnvValue(env, "OPENAI_API_KEY") ? "api" : "subscription";
 }
 
@@ -214,15 +213,143 @@ export async function ensureCodexSkillsInjected(
   );
 }
 
+async function executeNative(ctx: AdapterExecutionContext, ollamaUrl: string): Promise<AdapterExecutionResult> {
+  const { runId, agent, config, context, onLog, onMeta } = ctx;
+  const model = asString(config.model, "llama3");
+  const timeoutSec = asNumber(config.timeoutSec, 300);
+  const cwd = asString(asRecord(context.paperclipWorkspace)?.cwd, asString(config.cwd, process.cwd()));
+  const env = { ...buildPaperclipEnv(agent), ...parseObject(config.env) };
+  
+  await onLog("stdout", `[ollama-local] Using native adapter for model "${model}" at ${ollamaUrl}\n`);
+  
+  if (onMeta) {
+    await onMeta({
+      adapterType: "ollama_local",
+      command: "native-ollama-api",
+      cwd,
+      prompt: (ctx.context.paperclipWake as any)?.prompt ?? "",
+      context,
+    });
+  }
+
+  const messages: any[] = [
+    { role: "system", content: "You are a helpful AI assistant and an expert software engineer. You have access to a local terminal and tools to help you complete tasks." },
+  ];
+  
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake as any);
+  if (wakePrompt) {
+    messages.push({ role: "user", content: wakePrompt });
+  }
+
+  const tools = [
+    {
+      type: "function",
+      function: {
+        name: "run_shell_command",
+        description: "Execute a shell command in the current working directory",
+        parameters: {
+          type: "object",
+          properties: {
+            command: { type: "string", description: "The command to run" },
+            description: { type: "string", description: "Brief description of the command" }
+          },
+          required: ["command"]
+        }
+      }
+    }
+  ];
+
+  let turn = 0;
+  const maxTurns = 10;
+  let usage = { inputTokens: 0, outputTokens: 0 };
+
+  while (turn < maxTurns) {
+    turn++;
+    await onLog("stdout", `[ollama-local] Turn ${turn}/${maxTurns}...\n`);
+    
+    const response = await fetch(`${ollamaUrl}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ model, messages, tools, stream: false }),
+    });
+
+    if (!response.ok) {
+      throw new Error(`Ollama API error: ${response.status} ${await response.text()}`);
+    }
+
+    const result: any = await response.json();
+    const assistantMessage = result.message;
+    messages.push(assistantMessage);
+    
+    usage.inputTokens += result.prompt_eval_count ?? 0;
+    usage.outputTokens += result.eval_count ?? 0;
+
+    if (assistantMessage.content) {
+      await onLog("stdout", `${assistantMessage.content}\n`);
+    }
+
+    if (assistantMessage.tool_calls && assistantMessage.tool_calls.length > 0) {
+      for (const call of assistantMessage.tool_calls) {
+        const { name, arguments: args } = call.function;
+        await onLog("stdout", `[ollama-local] Executing tool "${name}" with args: ${JSON.stringify(args)}\n`);
+        
+        let toolOutput: string;
+        if (name === "run_shell_command") {
+          try {
+            const proc = await runChildProcess(runId, "bash", ["-c", args.command], {
+              cwd,
+              env: env as any,
+              timeoutSec: 60,
+              graceSec: 5,
+              onLog,
+            });
+            toolOutput = `Exit code: ${proc.exitCode}\nStdout: ${proc.stdout}\nStderr: ${proc.stderr}`;
+          } catch (err: any) {
+            toolOutput = `Error executing command: ${err.message}`;
+          }
+        } else {
+          toolOutput = `Unknown tool: ${name}`;
+        }
+        
+        messages.push({ role: "tool", content: toolOutput, tool_call_id: call.id });
+      }
+    } else {
+      break;
+    }
+  }
+
+  return {
+    exitCode: 0,
+    signal: null,
+    timedOut: false,
+    provider: "ollama",
+    model,
+    usage,
+    summary: messages[messages.length - 1].content,
+  };
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  return value as Record<string, unknown>;
+}
+
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const { runId, agent, runtime, config, context, onLog, onMeta, onSpawn, authToken } = ctx;
+
+  const model = asString(config.model, "");
+  const ollamaUrl = asString(config.url, asString(config.ollamaUrl, "")).replace(/\/$/, "");
+  const native = asBoolean(config.native, ollamaUrl.length > 0);
+
+  if (native) {
+    return await executeNative(ctx, ollamaUrl || "http://localhost:11434");
+  }
 
   const promptTemplate = asString(
     config.promptTemplate,
     "You are agent {{agent.id}} ({{agent.name}}). Continue your Paperclip work.",
   );
   const command = asString(config.command, "codex");
-  const model = asString(config.model, "");
   const modelReasoningEffort = asString(
     config.modelReasoningEffort,
     asString(config.reasoningEffort, ""),
@@ -276,8 +403,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const defaultCodexHome = resolveManagedCodexHomeDir(process.env, agent.companyId);
   const effectiveCodexHome = configuredCodexHome ?? preparedManagedCodexHome ?? defaultCodexHome;
   await fs.mkdir(effectiveCodexHome, { recursive: true });
-  // Inject skills into the same CODEX_HOME that Codex will actually run with
-  // (managed home in the default case, or an explicit override from adapter config).
   const codexSkillsDir = resolveCodexSkillsDir(effectiveCodexHome);
   await ensureCodexSkillsInjected(
     onLog,
@@ -412,12 +537,6 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     runtimeSessionId.length > 0 &&
     (runtimeSessionCwd.length === 0 || path.resolve(runtimeSessionCwd) === path.resolve(cwd));
   const sessionId = canResumeSession ? runtimeSessionId : null;
-  if (runtimeSessionId && !canResumeSession) {
-    await onLog(
-      "stdout",
-      `[paperclip] Codex session "${runtimeSessionId}" was saved for cwd "${runtimeSessionCwd}" and will not be resumed in "${cwd}".\n`,
-    );
-  }
   const instructionsFilePath = asString(config.instructionsFilePath, "").trim();
   const instructionsDir = instructionsFilePath ? `${path.dirname(instructionsFilePath)}/` : "";
   let instructionsPrefix = "";
@@ -454,7 +573,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     !sessionId && bootstrapPromptTemplate.trim().length > 0
       ? renderTemplate(bootstrapPromptTemplate, templateData).trim()
       : "";
-  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake, { resumedSession: Boolean(sessionId) });
+  const wakePrompt = renderPaperclipWakePrompt(context.paperclipWake as any, { resumedSession: Boolean(sessionId) });
   const shouldUseResumeDeltaPrompt = Boolean(sessionId) && wakePrompt.length > 0;
   const promptInstructionsPrefix = shouldUseResumeDeltaPrompt ? "" : instructionsPrefix;
   instructionsChars = promptInstructionsPrefix.length;
@@ -620,7 +739,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     sessionId &&
     !initial.proc.timedOut &&
     (initial.proc.exitCode ?? 0) !== 0 &&
-    isCodexUnknownSessionError(initial.proc.stdout, initial.rawStderr)
+    initial.parsed.errorMessage?.includes("Unknown session")
   ) {
     await onLog(
       "stdout",
